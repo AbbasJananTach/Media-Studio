@@ -55,6 +55,7 @@ import com.example.ui.settings.SettingsScreen
 import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.viewer.PhotoViewerScreen
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -87,6 +88,7 @@ class MainActivity : ComponentActivity() {
     // Prevents locking when launching system file picker, backup picker, or permission screen
     private var isLaunchingExternalPicker = false
     private var backgroundedElapsedTime = 0L
+    private var lastInteractionElapsedTime = SystemClock.elapsedRealtime()
     private var pendingImportFolderId: Long? = null
     private var pendingExportExternalBinsToGallery: Boolean = true
 
@@ -96,14 +98,17 @@ class MainActivity : ComponentActivity() {
     ) { uris ->
         isLaunchingExternalPicker = false
         backgroundedElapsedTime = 0L
+        lastInteractionElapsedTime = SystemClock.elapsedRealtime()
         val key = masterKey
         if (uris.isNotEmpty() && key != null) {
             val exportToGallery = pendingExportExternalBinsToGallery
+            val activeDecoyMode = isDecoyVault
             lifecycleScope.launch(Dispatchers.IO) {
                 val (recoveredCount, exportedCount) = vaultStorage.importAndRecoverExternalBinFiles(
                     uris = uris,
                     masterKey = key,
-                    exportToGallery = exportToGallery
+                    exportToGallery = exportToGallery,
+                    isDecoy = activeDecoyMode
                 )
                 withContext(Dispatchers.Main) {
                     dbRefreshTick++
@@ -238,6 +243,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             val themeMode by vaultPrefs.themeMode.collectAsState()
             val autoLockMode by vaultPrefs.autoLockMode.collectAsState()
+            val autoLockTimeoutMinutes by vaultPrefs.autoLockTimeoutMinutes.collectAsState()
             val bruteForceLockoutEnabled by vaultPrefs.bruteForceLockoutEnabled.collectAsState()
             val blockScreenshots by vaultPrefs.blockScreenshots.collectAsState()
             val defaultGridColumns by vaultPrefs.defaultGridColumns.collectAsState()
@@ -246,6 +252,26 @@ class MainActivity : ComponentActivity() {
             val isAutoHideEnabled by vaultPrefs.autoHideEnabled.collectAsState()
             val watchedFolders by vaultPrefs.watchedFolders.collectAsState()
             val progressState by VaultRepository.progressState.collectAsState()
+
+            // FIX 4: Enforce configurable Auto-Lock Timer (20m, 40m, or 60m default) while unlocked
+            LaunchedEffect(currentScreen.value, autoLockTimeoutMinutes) {
+                if (currentScreen.value !is Screen.Auth) {
+                    lastInteractionElapsedTime = SystemClock.elapsedRealtime()
+                    val timeoutMs = autoLockTimeoutMinutes.coerceAtLeast(1) * 60_000L
+                    while (currentScreen.value !is Screen.Auth && masterKey != null) {
+                        delay(15_000L)
+                        if (!isLaunchingExternalPicker && currentScreen.value !is Screen.VideoPlayer) {
+                            val elapsed = SystemClock.elapsedRealtime() - lastInteractionElapsedTime
+                            if (elapsed >= timeoutMs) {
+                                lockVaultNow()
+                                break
+                            }
+                        } else if (currentScreen.value is Screen.VideoPlayer) {
+                            lastInteractionElapsedTime = SystemClock.elapsedRealtime()
+                        }
+                    }
+                }
+            }
 
             // Point 19: Hoisted navigation tab, opened folder ID, and scroll states so pressing Back
             // from PhotoViewerScreen or VideoPlayerScreen returns directly to Folder X at the
@@ -879,6 +905,11 @@ class MainActivity : ComponentActivity() {
                                 onAutoLockModeChanged = { mode ->
                                     vaultPrefs.setAutoLockMode(mode)
                                 },
+                                autoLockTimeoutMinutes = autoLockTimeoutMinutes,
+                                onAutoLockTimeoutMinutesChanged = { minutes ->
+                                    vaultPrefs.setAutoLockTimeoutMinutes(minutes)
+                                    lastInteractionElapsedTime = SystemClock.elapsedRealtime()
+                                },
                                 themeMode = themeMode,
                                 onThemeModeChanged = { mode ->
                                     vaultPrefs.setThemeMode(mode)
@@ -1205,6 +1236,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onUserInteraction() {
+        super.onUserInteraction()
+        lastInteractionElapsedTime = SystemClock.elapsedRealtime()
+    }
+
     override fun onResume() {
         super.onResume()
         database = VaultDatabase.getInstance(this)
@@ -1213,15 +1249,26 @@ class MainActivity : ComponentActivity() {
         if (isLaunchingExternalPicker) {
             isLaunchingExternalPicker = false
             backgroundedElapsedTime = 0L
+            lastInteractionElapsedTime = SystemClock.elapsedRealtime()
             return
         }
-        if (backgroundedElapsedTime > 0L && masterKey != null) {
-            val elapsed = SystemClock.elapsedRealtime() - backgroundedElapsedTime
-            val timeout = vaultPrefs.autoLockMode.value.timeoutMs
-            if (timeout >= 0L && elapsed >= timeout) {
+        if (masterKey != null) {
+            val now = SystemClock.elapsedRealtime()
+            val timerTimeoutMs = vaultPrefs.autoLockTimeoutMinutes.value.coerceAtLeast(1) * 60_000L
+            if (lastInteractionElapsedTime > 0L && (now - lastInteractionElapsedTime) >= timerTimeoutMs) {
                 lockVaultNow()
+                backgroundedElapsedTime = 0L
+                return
             }
-            backgroundedElapsedTime = 0L
+            if (backgroundedElapsedTime > 0L) {
+                val elapsed = now - backgroundedElapsedTime
+                val modeTimeout = vaultPrefs.autoLockMode.value.timeoutMs
+                if ((modeTimeout >= 0L && elapsed >= modeTimeout) || elapsed >= timerTimeoutMs) {
+                    lockVaultNow()
+                }
+                backgroundedElapsedTime = 0L
+            }
+            lastInteractionElapsedTime = now
         }
     }
 

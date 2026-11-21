@@ -119,6 +119,8 @@ fun SettingsScreen(
     // Auto-Lock
     autoLockMode: AutoLockMode,
     onAutoLockModeChanged: (AutoLockMode) -> Unit,
+    autoLockTimeoutMinutes: Int = 60,
+    onAutoLockTimeoutMinutesChanged: (Int) -> Unit = {},
     // Display & Theme
     themeMode: VaultThemeMode,
     onThemeModeChanged: (VaultThemeMode) -> Unit,
@@ -516,6 +518,56 @@ fun SettingsScreen(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(mode.label, fontWeight = FontWeight.Medium)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Text(
+                        "Auto-Lock Timer",
+                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    Text(
+                        "Automatically locks the vault after the selected duration (Default: 1 Hour)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        val timerOptions = listOf(
+                            20 to "20 Minutes",
+                            40 to "40 Minutes",
+                            60 to "1 Hour (60 Min)"
+                        )
+                        timerOptions.forEach { (minutes, label) ->
+                            FilterChip(
+                                selected = autoLockTimeoutMinutes == minutes,
+                                onClick = { onAutoLockTimeoutMinutesChanged(minutes) },
+                                label = {
+                                    Text(
+                                        text = label,
+                                        fontSize = 12.sp,
+                                        fontWeight = if (autoLockTimeoutMinutes == minutes) FontWeight.Bold else FontWeight.Medium
+                                    )
+                                },
+                                leadingIcon = if (autoLockTimeoutMinutes == minutes) {
+                                    {
+                                        Icon(
+                                            Icons.Default.Check,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                } else null,
+                                modifier = Modifier.testTag("auto_lock_timer_${minutes}m")
+                            )
                         }
                     }
                 }

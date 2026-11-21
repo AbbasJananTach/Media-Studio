@@ -34,6 +34,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.io.RandomAccessFile
 import java.util.ArrayDeque
 import java.util.LinkedHashMap
 import java.util.Locale
@@ -145,11 +146,92 @@ class VaultStorage(private val context: Context) {
     }
 
     /**
+     * FIX 2B: Strict exclusion filter for `DeviceMediaBrowserSheet` so hidden vault files,
+     * `.LocalVaultData`, any path containing `LocalVault`, `.tmp_`, `.bin`, `.thumb`, `.meta`,
+     * `.nomedia` directories, and any file matching an existing `originalPath` in `VaultDatabase`
+     * NEVER appear in the media picker (in either Real Mode or Decoy Mode).
+     */
+    fun isExcludedFromDeviceMediaPicker(
+        path: String,
+        existingVaultOriginalPaths: Set<String> = emptySet()
+    ): Boolean {
+        if (path.isBlank()) return true
+        val normalized = path.replace('\\', '/')
+        val lowerPath = normalized.lowercase(Locale.US)
+        if (lowerPath.contains("/.localvaultdata") ||
+            lowerPath.contains("localvault") ||
+            lowerPath.contains("/.trash") ||
+            lowerPath.contains("/.thumbnails")
+        ) {
+            return true
+        }
+
+        val file = File(path)
+        val name = file.name
+        val lowerName = name.lowercase(Locale.US)
+        if (name.startsWith(".") ||
+            lowerName.startsWith(".tmp_") ||
+            lowerName.endsWith(".bin") ||
+            lowerName.endsWith(".thumb") ||
+            lowerName.endsWith(".meta") ||
+            lowerName.endsWith(".enc") ||
+            lowerName.endsWith(".header") ||
+            lowerName.endsWith(".lvb") ||
+            lowerName.endsWith(".nomedia")
+        ) {
+            return true
+        }
+
+        // Check if any parent directory is a hidden dot-folder (e.g., /.LocalVaultData/)
+        val segments = normalized.split('/')
+        for (i in 0 until (segments.size - 1)) {
+            val seg = segments[i]
+            if (seg.startsWith(".") && seg.length > 1) {
+                return true
+            }
+        }
+
+        if (existingVaultOriginalPaths.isNotEmpty()) {
+            if (path in existingVaultOriginalPaths || lowerPath in existingVaultOriginalPaths) {
+                return true
+            }
+            val canonical = try {
+                file.canonicalPath
+            } catch (_: Throwable) {
+                null
+            }
+            if (canonical != null && (canonical in existingVaultOriginalPaths || canonical.lowercase(Locale.US) in existingVaultOriginalPaths)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private suspend fun loadExistingVaultOriginalPathsLower(): Set<String> {
+        return try {
+            val allItems = vaultDao.getAllItemsSync()
+            val set = HashSet<String>(allItems.size * 2)
+            for (item in allItems) {
+                val orig = item.originalPath.trim()
+                if (orig.isNotEmpty()) {
+                    set.add(orig)
+                    set.add(orig.lowercase(Locale.US))
+                }
+            }
+            set
+        } catch (_: Throwable) {
+            emptySet()
+        }
+    }
+
+    /**
      * Queries all device media files from MediaStore (including HEIC, WEBP, BMP, GIF, PNG, JPG, and Videos).
-     * Excludes anything already inside `.LocalVaultData`.
+     * Strictly excludes `.LocalVaultData`, `LocalVault`, `.tmp_`, `.bin`, `.thumb`, `.meta`, and any path
+     * matching an existing `originalPath` in `VaultDatabase`.
      */
     suspend fun queryDeviceMediaFiles(folderFilter: String? = null): List<DeviceMediaItem> = withContext(Dispatchers.IO) {
         val result = LinkedHashMap<String, DeviceMediaItem>()
+        val existingVaultOriginalPaths = loadExistingVaultOriginalPathsLower()
         val projection = arrayOf(
             MediaStore.Files.FileColumns._ID,
             MediaStore.MediaColumns.DATA,
@@ -161,7 +243,7 @@ class VaultStorage(private val context: Context) {
             MediaStore.Video.Media.DURATION
         )
 
-        val selection = "${MediaStore.MediaColumns.DATA} NOT LIKE '%/.LocalVaultData/%'"
+        val selection = "${MediaStore.MediaColumns.DATA} NOT LIKE '%/.LocalVaultData/%' AND ${MediaStore.MediaColumns.DATA} NOT LIKE '%LocalVault%'"
         val sortOrder = "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
 
         try {
@@ -184,6 +266,7 @@ class VaultStorage(private val context: Context) {
                 while (cursor.moveToNext()) {
                     val path = if (dataCol != -1) cursor.getString(dataCol) ?: "" else ""
                     if (path.isEmpty() || result.containsKey(path)) continue
+                    if (isExcludedFromDeviceMediaPicker(path, existingVaultOriginalPaths)) continue
                     val file = File(path)
                     if (!file.exists() || !file.isFile || file.length() <= 0L) continue
 
@@ -227,12 +310,13 @@ class VaultStorage(private val context: Context) {
 
     suspend fun queryDeviceFolders(): List<String> = withContext(Dispatchers.IO) {
         val folders = mutableSetOf<String>()
+        val existingVaultOriginalPaths = loadExistingVaultOriginalPathsLower()
         val projection = arrayOf(
             MediaStore.MediaColumns.DATA,
             MediaStore.MediaColumns.BUCKET_DISPLAY_NAME,
             MediaStore.Files.FileColumns.MEDIA_TYPE
         )
-        val selection = "${MediaStore.MediaColumns.DATA} NOT LIKE '%/.LocalVaultData/%'"
+        val selection = "${MediaStore.MediaColumns.DATA} NOT LIKE '%/.LocalVaultData/%' AND ${MediaStore.MediaColumns.DATA} NOT LIKE '%LocalVault%'"
         try {
             context.contentResolver.query(
                 MediaStore.Files.getContentUri("external"),
@@ -246,8 +330,9 @@ class VaultStorage(private val context: Context) {
                 val typeCol = cursor.getColumnIndex(MediaStore.Files.FileColumns.MEDIA_TYPE)
                 while (cursor.moveToNext()) {
                     val path = if (dataCol != -1) cursor.getString(dataCol) ?: "" else ""
+                    if (path.isEmpty() || isExcludedFromDeviceMediaPicker(path, existingVaultOriginalPaths)) continue
                     val file = File(path)
-                    if (path.isNotEmpty() && file.exists()) {
+                    if (file.exists() && file.isFile && file.length() > 0L) {
                         val mediaType = if (typeCol != -1) cursor.getInt(typeCol) else 0
                         if (mediaType == MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE ||
                             mediaType == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO ||
@@ -436,22 +521,12 @@ class VaultStorage(private val context: Context) {
     }
 
     /**
-     * Emergency & Automatic Orphaned / Invisible Vault File Recovery (Requirement 1):
-     * 1. Consolidates any files from internal/external app-specific `.LocalVaultData` fallback
-     *    directories and any rows from internal `local_vault.db`.
-     * 2. Scans EVERY physical file across `vaultRootDir.walkTopDown().filter { it.isFile }`,
-     *    skipping thumbnail files (`*.thumb`) and metadata/database files (`*.meta`, `*.json`,
-     *    `vault_catalog.enc`, `vault.header`, `local_vault.db*`).
-     * 3. Compares every physical vault file on disk against the loaded metadata index
-     *    (`vaultFilePath` / `encryptedRelativePath`).
-     * 4. For EVERY physical file on disk that is missing from the metadata index:
-     *    - Recovers from `.meta` sidecar, `vault_catalog.enc`, or legacy DB if available.
-     *    - Otherwise inspects its decrypted header / magic bytes (first 16..64 bytes decrypted)
-     *      or file extension to automatically detect whether it is a Video (`ftyp`, `mp4`, `mkv`,
-     *      `webm`, `avi`, `mov`) or an Image (`FF D8 FF` JPG, `89 50 4E 47` PNG, `WEBP`, `HEIC`, `GIF`).
-     *    - Reconstructs a valid `VaultItem` metadata entry (assigning to root vault or subfolder,
-     *      setting real file size and lastModified timestamp, and generating missing thumbnails).
-     *    - Saves all recovered items into the metadata index immediately.
+     * Emergency & Automatic Orphaned / Invisible Vault File Recovery (FIX 1 & FIX 2):
+     * - Detects the 32-byte `LVBIN001` header (`baseIv` at bytes `8..23`, `plaintextSize` at bytes `24..31`)
+     *   first, with fallback to `.meta` sidecar, `vault_catalog.enc`, legacy DB, and mathematical
+     *   AES-CTR header recovery for legacy headerless `.bin` files.
+     * - Strictly preserves each item's `isDecoy` flag from `.bin.meta` / Room DB so Decoy files
+     *   NEVER leak into Real Vault and Real Vault files NEVER leak into Decoy Vault!
      */
     suspend fun recoverOrphanedVaultFiles(
         masterKey: SecretKey,
@@ -655,7 +730,7 @@ class VaultStorage(private val context: Context) {
             }
 
             // Step 6: Reconcile existing DB rows, collect sibling 16-byte plaintext headers,
-            // and repair any previously recovered items whose baseIvHex had a fallback IV
+            // and repair any previously recovered items while STRICTLY PRESERVING `isDecoy` (FIX 2A).
             val validExistingItems = reconcilePhysicalFilesLocked(masterKey = null)
             val siblingPlainHeaders = if (masterKey != null) {
                 collectSiblingPlainHeaders(masterKey, validExistingItems)
@@ -673,63 +748,88 @@ class VaultStorage(private val context: Context) {
                     repairedItem = repairedItem.copy(folderId = null)
                     needsUpdate = true
                 }
-                // Ensure items in Real Vault have isDecoy = false so they are never hidden
-                if (!isDecoy && repairedItem.isDecoy) {
-                    repairedItem = repairedItem.copy(isDecoy = false)
+
+                // FIX 2A: Never overwrite a Decoy item's `isDecoy = true` with `false`!
+                // If the item's `.bin.meta` sidecar or catalog entry specifies `isDecoy = true`, preserve it.
+                val sidecarMeta = sidecarItemsByPath[repairedItem.encryptedRelativePath]
+                    ?: catalogItemsByPath[repairedItem.encryptedRelativePath]
+                if (sidecarMeta != null && sidecarMeta.isDecoy != repairedItem.isDecoy) {
+                    repairedItem = repairedItem.copy(isDecoy = sidecarMeta.isDecoy)
                     needsUpdate = true
                 }
 
-                // If an existing item has an unverified IV (e.g. from an earlier fallback recovery),
-                // check if its decrypted header is valid; if not, run mathematical AES-CTR baseIv recovery!
                 if (masterKey != null) {
                     val blobFile = File(vaultBlobsDir, repairedItem.encryptedRelativePath)
                     if (blobFile.exists() && blobFile.length() >= 16L) {
-                        val currentIv = fromHex(repairedItem.baseIvHex)
-                        val headerSample = readFirstNBytes(blobFile, 64)
-                        val currentDecrypted = if (currentIv.size == 16) {
-                            CryptoEngine.decryptHeaderBytesCtr(headerSample, masterKey, currentIv)
-                        } else {
-                            ByteArray(0)
-                        }
-                        if (CryptoEngine.verifyDecryptedHeader64(currentDecrypted) == null) {
-                            val recoveredIvAndMime = recoverOrphanedBinBaseIvAndMime(
-                                blobFile = blobFile,
-                                masterKey = masterKey,
-                                siblingPlainHeaders = siblingPlainHeaders
-                            )
-                            if (recoveredIvAndMime != null) {
-                                val (trueIv, trueMime) = recoveredIvAndMime
-                                val newExt = extensionFromMimeType(trueMime)
-                                // FIX 2: Preserve user's original filename whenever it is not a generic Recovered_ placeholder
-                                val existingName = repairedItem.fileName
-                                val updatedFileName = if (existingName.startsWith("Recovered_Photo") || existingName.startsWith("Recovered_Video")) {
-                                    val baseTitle = existingName.substringBeforeLast('.')
-                                        .replace("Recovered_Photo", if (trueMime.startsWith("video")) "Recovered_Video" else "Recovered_Photo")
-                                    "$baseTitle$newExt"
-                                } else if (existingName.isNotBlank() && !existingName.all { it.isDigit() }) {
-                                    existingName
-                                } else {
-                                    val origName = File(repairedItem.originalPath).name
-                                    if (origName.isNotBlank() && !origName.all { it.isDigit() }) origName else "$existingName$newExt"
-                                }
-                                val unlockedDecrypted = CryptoEngine.decryptHeaderBytesCtr(headerSample, masterKey, trueIv)
-                                if (unlockedDecrypted.size >= 16) {
-                                    siblingPlainHeaders.add(0, unlockedDecrypted.copyOfRange(0, 16))
-                                }
-                                val durMs = if (trueMime.startsWith("video") && repairedItem.durationMs <= 0L) {
-                                    extractEncryptedVideoDurationMs(blobFile, masterKey, trueIv)
-                                } else {
-                                    repairedItem.durationMs
-                                }
+                        val (lvHeader, headerSample) = CryptoEngine.readCiphertextHeaderSample(blobFile, 64)
+                        if (lvHeader != null) {
+                            val embeddedIvHex = toHex(lvHeader.baseIv)
+                            val embeddedSize = if (lvHeader.plaintextSize > 0L) {
+                                lvHeader.plaintextSize
+                            } else {
+                                (blobFile.length() - CryptoEngine.LVBIN_HEADER_SIZE).coerceAtLeast(0L)
+                            }
+                            if (!repairedItem.baseIvHex.equals(embeddedIvHex, ignoreCase = true) ||
+                                (embeddedSize > 0L && repairedItem.fileSize != embeddedSize)
+                            ) {
                                 repairedItem = repairedItem.copy(
-                                    fileName = updatedFileName,
-                                    mimeType = trueMime,
-                                    durationMs = durMs,
-                                    baseIvHex = toHex(trueIv),
-                                    isDecoy = false
+                                    baseIvHex = embeddedIvHex,
+                                    fileSize = if (embeddedSize > 0L) embeddedSize else repairedItem.fileSize
                                 )
                                 needsUpdate = true
-                                repairedExistingCount++
+                                if (repairedItem.isDecoy == isDecoy) {
+                                    repairedExistingCount++
+                                }
+                            }
+                        } else {
+                            val currentIv = fromHex(repairedItem.baseIvHex)
+                            val currentDecrypted = if (currentIv.size == 16) {
+                                CryptoEngine.decryptHeaderBytesCtr(headerSample, masterKey, currentIv)
+                            } else {
+                                ByteArray(0)
+                            }
+                            if (CryptoEngine.verifyDecryptedHeader64(currentDecrypted) == null) {
+                                val recoveredIvAndMime = recoverOrphanedBinBaseIvAndMime(
+                                    blobFile = blobFile,
+                                    masterKey = masterKey,
+                                    siblingPlainHeaders = siblingPlainHeaders
+                                )
+                                if (recoveredIvAndMime != null) {
+                                    val (trueIv, trueMime) = recoveredIvAndMime
+                                    val newExt = extensionFromMimeType(trueMime)
+                                    val existingName = repairedItem.fileName
+                                    val updatedFileName = if (existingName.startsWith("Recovered_Photo") || existingName.startsWith("Recovered_Video")) {
+                                        val baseTitle = existingName.substringBeforeLast('.')
+                                            .replace("Recovered_Photo", if (trueMime.startsWith("video")) "Recovered_Video" else "Recovered_Photo")
+                                        "$baseTitle$newExt"
+                                    } else if (existingName.isNotBlank() && !existingName.all { it.isDigit() }) {
+                                        existingName
+                                    } else {
+                                        val origName = File(repairedItem.originalPath).name
+                                        if (origName.isNotBlank() && !origName.all { it.isDigit() }) origName else "$existingName$newExt"
+                                    }
+                                    val unlockedDecrypted = CryptoEngine.decryptHeaderBytesCtr(headerSample, masterKey, trueIv)
+                                    if (unlockedDecrypted.size >= 16) {
+                                        siblingPlainHeaders.add(0, unlockedDecrypted.copyOfRange(0, 16))
+                                    }
+                                    val durMs = if (trueMime.startsWith("video") && repairedItem.durationMs <= 0L) {
+                                        extractEncryptedVideoDurationMs(blobFile, masterKey, trueIv)
+                                    } else {
+                                        repairedItem.durationMs
+                                    }
+                                    // FIX 2A: Preserve `repairedItem.isDecoy`—never hardcode `isDecoy = false`!
+                                    repairedItem = repairedItem.copy(
+                                        fileName = updatedFileName,
+                                        mimeType = trueMime,
+                                        durationMs = durMs,
+                                        baseIvHex = toHex(trueIv),
+                                        isDecoy = repairedItem.isDecoy
+                                    )
+                                    needsUpdate = true
+                                    if (repairedItem.isDecoy == isDecoy) {
+                                        repairedExistingCount++
+                                    }
+                                }
                             }
                         }
                     }
@@ -744,9 +844,9 @@ class VaultStorage(private val context: Context) {
                 indexedByPath[repairedItem.encryptedRelativePath] = repairedItem
             }
 
-            // Map folder names to IDs for subfolder assignment
+            // Map folder names to IDs for subfolder assignment (scoped by isDecoy)
             val foldersByNameLower = existingFolders.values
-                .associateBy { it.folderName.lowercase(Locale.US) }
+                .associateBy { "${it.isDecoy}:${it.folderName.lowercase(Locale.US)}" }
                 .toMutableMap()
 
             val newlyRecoveredItems = CopyOnWriteArrayList<VaultItem>()
@@ -772,10 +872,19 @@ class VaultStorage(private val context: Context) {
                     continue
                 }
 
+                // Try Sidecar -> Catalog -> Legacy DB -> Self-Contained LVBIN001 / Mathematical Header Reconstruction
+                val knownMeta = sidecarItemsByPath[blobName]
+                    ?: catalogItemsByPath[blobName]
+                    ?: legacyDbItemsByPath[blobName]
+
+                // FIX 2A: Preserve the item's authentic `isDecoy` flag from `.bin.meta` / catalog / legacy DB!
+                val itemIsDecoy = knownMeta?.isDecoy ?: isDecoy
+
                 // Resolve subfolder ID if physical file was inside a named subfolder
                 var resolvedSubfolderId: Long? = null
                 if (!subfolderName.isNullOrBlank()) {
-                    val existingFolder = foldersByNameLower[subfolderName.lowercase(Locale.US)]
+                    val folderKey = "$itemIsDecoy:${subfolderName.lowercase(Locale.US)}"
+                    val existingFolder = foldersByNameLower[folderKey]
                     if (existingFolder != null) {
                         resolvedSubfolderId = existingFolder.id
                     } else {
@@ -783,26 +892,34 @@ class VaultStorage(private val context: Context) {
                             folderName = subfolderName,
                             isLocked = false,
                             lockType = "MAIN_PIN",
-                            isDecoy = false
+                            isDecoy = itemIsDecoy
                         )
                         val newFolderId = folderDao.insertFolder(newFolder)
                         val savedFolder = newFolder.copy(id = newFolderId)
                         existingFolders[newFolderId] = savedFolder
-                        foldersByNameLower[subfolderName.lowercase(Locale.US)] = savedFolder
+                        foldersByNameLower[folderKey] = savedFolder
                         resolvedSubfolderId = newFolderId
                     }
                 }
 
-                // Try Sidecar -> Catalog -> Legacy DB -> Mathematical AES-CTR Header Reconstruction
-                val knownMeta = sidecarItemsByPath[blobName]
-                    ?: catalogItemsByPath[blobName]
-                    ?: legacyDbItemsByPath[blobName]
-
                 val recoveredItem = if (knownMeta != null && knownMeta.baseIvHex.length == 32) {
-                    val validFolderId = knownMeta.folderId?.takeIf { it in existingFolders } ?: resolvedSubfolderId
-                    // Verify if knownMeta's baseIvHex actually decrypts to a valid media header; if not, try mathematical recovery
-                    val verifiedKnownItem = if (masterKey != null) {
-                        val headerSample = readFirstNBytes(blobFile, 64)
+                    val validFolderId = knownMeta.folderId?.takeIf {
+                        val f = existingFolders[it]
+                        f != null && f.isDecoy == itemIsDecoy
+                    } ?: resolvedSubfolderId
+
+                    val (lvHeader, headerSample) = CryptoEngine.readCiphertextHeaderSample(blobFile, 64)
+                    val verifiedKnownItem = if (lvHeader != null) {
+                        val plainSize = if (lvHeader.plaintextSize > 0L) {
+                            lvHeader.plaintextSize
+                        } else {
+                            (blobFile.length() - CryptoEngine.LVBIN_HEADER_SIZE).coerceAtLeast(0L)
+                        }
+                        knownMeta.copy(
+                            baseIvHex = toHex(lvHeader.baseIv),
+                            fileSize = plainSize
+                        )
+                    } else if (masterKey != null) {
                         val knownIv = fromHex(knownMeta.baseIvHex)
                         val dec = CryptoEngine.decryptHeaderBytesCtr(headerSample, masterKey, knownIv)
                         if (CryptoEngine.verifyDecryptedHeader64(dec) != null) {
@@ -826,12 +943,20 @@ class VaultStorage(private val context: Context) {
                         knownMeta
                     }
 
+                    val logicalSize = if (lvHeader != null && lvHeader.plaintextSize > 0L) {
+                        lvHeader.plaintextSize
+                    } else if (lvHeader != null) {
+                        (blobFile.length() - CryptoEngine.LVBIN_HEADER_SIZE).coerceAtLeast(0L)
+                    } else {
+                        blobFile.length()
+                    }
+
                     verifiedKnownItem.copy(
                         id = 0L,
                         encryptedRelativePath = blobName,
-                        fileSize = blobFile.length(),
+                        fileSize = logicalSize,
                         folderId = validFolderId,
-                        isDecoy = false
+                        isDecoy = itemIsDecoy
                     )
                 } else {
                     reconstructVaultItemFromPhysicalFile(
@@ -839,7 +964,7 @@ class VaultStorage(private val context: Context) {
                         subfolderId = resolvedSubfolderId,
                         sequenceIndex = seqCounter++,
                         masterKey = masterKey,
-                        isDecoy = false,
+                        isDecoy = itemIsDecoy,
                         siblingPlainHeaders = siblingPlainHeaders
                     )
                 }
@@ -887,30 +1012,31 @@ class VaultStorage(private val context: Context) {
                 syncEncryptedCatalogLocked(masterKey)
             }
 
-            val totalRecoveredOrRepaired = newlyRecoveredItems.size + repairedExistingCount
+            val recoveredForActiveMode = newlyRecoveredItems.count { it.isDecoy == isDecoy } + repairedExistingCount
+            val totalForActiveMode = indexedByPath.values.count { it.isDecoy == isDecoy }
 
             if (showProgress) {
                 VaultRepository.updateProgress(
                     title = "Scanning Vault Directories...",
-                    currentItem = totalPhysicalCount,
-                    totalItems = totalPhysicalCount,
+                    currentItem = totalForActiveMode,
+                    totalItems = totalForActiveMode,
                     percentage = 100,
-                    subText = "Recovered $totalRecoveredOrRepaired file(s) • $totalPhysicalCount total",
+                    subText = "Recovered $recoveredForActiveMode file(s) • $totalForActiveMode total",
                     forceEmit = true
                 )
                 VaultRepository.hideProgress()
             }
 
             return VaultRecoveryReport(
-                recoveredCount = totalRecoveredOrRepaired,
-                totalVaultFilesOnDisk = indexedByPath.size
+                recoveredCount = recoveredForActiveMode,
+                totalVaultFilesOnDisk = totalForActiveMode
             )
         } catch (_: Throwable) {
             if (showProgress) {
                 VaultRepository.hideProgress()
             }
             val currentCount = try {
-                vaultDao.getAllItemsSync().size
+                vaultDao.getAllItemsByDecoySync(isDecoy = isDecoy).size
             } catch (_: Throwable) {
                 0
             }
@@ -953,8 +1079,8 @@ class VaultStorage(private val context: Context) {
             try {
                 val blob = File(vaultBlobsDir, item.encryptedRelativePath)
                 if (!blob.exists() || blob.length() < 64L) continue
-                val iv = fromHex(item.baseIvHex)
-                val enc64 = readFirstNBytes(blob, 64)
+                val (lvHeader, enc64) = CryptoEngine.readCiphertextHeaderSample(blob, 64)
+                val iv = lvHeader?.baseIv ?: fromHex(item.baseIvHex)
                 val dec64 = CryptoEngine.decryptHeaderBytesCtr(enc64, masterKey, iv)
                 if (CryptoEngine.verifyDecryptedHeader64(dec64) != null) {
                     val p0 = dec64.copyOfRange(0, 16)
@@ -1032,6 +1158,7 @@ class VaultStorage(private val context: Context) {
     /**
      * Extracts the duration in milliseconds of an AES-CTR encrypted video blob using a streaming
      * `MediaDataSource` over `RandomAccessFile` + `CryptoEngine.calculateCtrIvForOffset`.
+     * Automatically detects the 32-byte `LVBIN001` header when present.
      */
     private fun extractEncryptedVideoDurationMs(
         blobFile: File,
@@ -1039,14 +1166,18 @@ class VaultStorage(private val context: Context) {
         baseIv: ByteArray
     ): Long {
         if (!blobFile.exists() || blobFile.length() < 64L || baseIv.size != 16) return 0L
+        val lvHeader = CryptoEngine.readLvBinHeader(blobFile)
+        val payloadOffset = if (lvHeader != null) CryptoEngine.LVBIN_HEADER_SIZE.toLong() else 0L
+        val effectiveIv = lvHeader?.baseIv ?: baseIv
+
         val retriever = MediaMetadataRetriever()
         return try {
             val raf = java.io.RandomAccessFile(blobFile, "r")
-            val fileLen = blobFile.length()
+            val logicalLen = (blobFile.length() - payloadOffset).coerceAtLeast(0L)
             val dataSource = object : android.media.MediaDataSource() {
                 override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
-                    if (position >= fileLen) return -1
-                    val toRead = minOf(size.toLong(), fileLen - position).toInt()
+                    if (position >= logicalLen) return -1
+                    val toRead = minOf(size.toLong(), logicalLen - position).toInt()
                     if (toRead <= 0) return -1
                     val blockAlignedStart = (position / 16L) * 16L
                     val skipBytes = (position - blockAlignedStart).toInt()
@@ -1054,11 +1185,11 @@ class VaultStorage(private val context: Context) {
                     val cipherBuf = ByteArray(cipherLen)
                     val actualRead: Int
                     synchronized(raf) {
-                        raf.seek(blockAlignedStart)
+                        raf.seek(payloadOffset + blockAlignedStart)
                         actualRead = raf.read(cipherBuf, 0, cipherLen)
                     }
                     if (actualRead <= skipBytes) return -1
-                    val counterIv = CryptoEngine.calculateCtrIvForOffset(baseIv, blockAlignedStart)
+                    val counterIv = CryptoEngine.calculateCtrIvForOffset(effectiveIv, blockAlignedStart)
                     val cipher = Cipher.getInstance("AES/CTR/NoPadding")
                     cipher.init(Cipher.DECRYPT_MODE, masterKey, IvParameterSpec(counterIv))
                     val plainBuf = cipher.doFinal(cipherBuf, 0, actualRead)
@@ -1067,7 +1198,7 @@ class VaultStorage(private val context: Context) {
                     return available
                 }
 
-                override fun getSize(): Long = fileLen
+                override fun getSize(): Long = logicalLen
 
                 override fun close() {
                     try {
@@ -1095,13 +1226,12 @@ class VaultStorage(private val context: Context) {
 
     /**
      * Reconstructs a valid `VaultItem` for an unindexed physical `.bin` file on disk:
-     * 1. Checks if raw header bytes match unencrypted media (and encrypts in-place if so).
-     * 2. Uses `recoverOrphanedBinBaseIvAndMime(blobFile, masterKey, siblingPlainHeaders)` to
-     *    mathematically recover the exact 16-byte `baseIv` via AES-ECB inversion ($C_0 \oplus P_0$)
-     *    verified against Block 1/2/3 (`moov`/`mdat`/`free` atoms or `IHDR`/`JFIF` markers).
-     * 3. Extracts video duration and links existing `.bin.thumb` in `vaultThumbsDir`.
-     * 4. Even if an exotic file doesn't match a known header, still recovers and indexes the `.bin`
-     *    file with a fallback IV and its decrypted `.bin.thumb` thumbnail so NO `.bin` file is ever left behind.
+     * 0. If the file carries the 32-byte `LVBIN001` header, reads `baseIv` directly from bytes `8..23`
+     *    and `plaintextSize` from bytes `24..31` with 100% accuracy!
+     * 1. Checks if raw header bytes match unencrypted media (and encrypts in-place with an `LVBIN001` header if so).
+     * 2. For legacy headerless `.bin` files, uses `recoverOrphanedBinBaseIvAndMime(blobFile, masterKey, siblingPlainHeaders)`
+     *    to mathematically recover the exact 16-byte `baseIv` via AES-ECB inversion ($C_0 \oplus P_0$).
+     * 3. Preserves the active `isDecoy` flag (FIX 2A) so Decoy files never leak into Real Vault.
      */
     private fun reconstructVaultItemFromPhysicalFile(
         blobFile: File,
@@ -1112,7 +1242,8 @@ class VaultStorage(private val context: Context) {
         siblingPlainHeaders: MutableList<ByteArray> = ArrayList()
     ): VaultItem {
         val blobName = blobFile.name
-        val actualHeader = readFirstNBytes(blobFile, 64)
+        val (lvHeader, cipherSample) = CryptoEngine.readCiphertextHeaderSample(blobFile, 64)
+        val rawFirst64 = readFirstNBytes(blobFile, 64)
 
         val deterministicIv = if (masterKey != null) {
             CryptoEngine.deriveDeterministicIv(masterKey, blobName)
@@ -1120,28 +1251,47 @@ class VaultStorage(private val context: Context) {
             ByteArray(16)
         }
 
-        var chosenIv: ByteArray = deterministicIv
+        var chosenIv: ByteArray = lvHeader?.baseIv ?: deterministicIv
         var detectedMime: String? = null
         var detectedExt: String? = null
+        var logicalPlainSize: Long = if (lvHeader != null) {
+            if (lvHeader.plaintextSize > 0L) lvHeader.plaintextSize
+            else (blobFile.length() - CryptoEngine.LVBIN_HEADER_SIZE).coerceAtLeast(0L)
+        } else {
+            blobFile.length()
+        }
+
+        // 0. If LVBIN001 32-byte header is present, baseIv is already known with 100% certainty
+        if (lvHeader != null && masterKey != null && cipherSample.isNotEmpty()) {
+            val dec64 = CryptoEngine.decryptHeaderBytesCtr(cipherSample, masterKey, lvHeader.baseIv)
+            val sig = CryptoEngine.detectMediaSignature(dec64)
+            if (sig != null) {
+                detectedMime = sig.mimeType
+                detectedExt = sig.extension
+                if (dec64.size >= 16) {
+                    siblingPlainHeaders.add(0, dec64.copyOfRange(0, 16))
+                }
+            }
+        }
 
         // 1. Check if raw header bytes match unencrypted media magic bytes
-        val rawSig = CryptoEngine.detectMediaSignature(actualHeader)
+        val rawSig = if (lvHeader == null) CryptoEngine.detectMediaSignature(rawFirst64) else null
         if (rawSig != null && masterKey != null) {
             val tempEnc = File(vaultBlobsDir, ".tmp_enc_$blobName")
+            val sourceLen = blobFile.length()
             try {
-                val cipher = Cipher.getInstance("AES/CTR/NoPadding")
-                cipher.init(Cipher.ENCRYPT_MODE, masterKey, IvParameterSpec(deterministicIv))
+                val headerBytes = CryptoEngine.buildLvBinHeader(deterministicIv, sourceLen)
+                var writtenPayload = 0L
                 BufferedInputStream(FileInputStream(blobFile), IO_CHUNK_BUFFER_BYTES).use { bis ->
                     FileOutputStream(tempEnc).use { fos ->
                         BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bos ->
-                            CipherOutputStream(bos, cipher).use { cos ->
-                                val buf = ByteArray(IO_CHUNK_BUFFER_BYTES)
-                                var r: Int
-                                while (bis.read(buf).also { r = it } != -1) {
-                                    cos.write(buf, 0, r)
-                                }
-                                cos.flush()
-                            }
+                            bos.write(headerBytes)
+                            writtenPayload = CryptoEngine.encryptStreamCtr(
+                                inputStream = bis,
+                                outputStream = bos,
+                                secretKey = masterKey,
+                                baseIv = deterministicIv
+                            )
                             bos.flush()
                         }
                         try {
@@ -1150,9 +1300,10 @@ class VaultStorage(private val context: Context) {
                         }
                     }
                 }
-                if (tempEnc.exists() && tempEnc.length() == blobFile.length()) {
+                if (tempEnc.exists() && tempEnc.length() == CryptoEngine.LVBIN_HEADER_SIZE.toLong() + sourceLen && writtenPayload == sourceLen) {
                     blobFile.delete()
                     tempEnc.renameTo(blobFile)
+                    logicalPlainSize = sourceLen
                 } else {
                     tempEnc.delete()
                 }
@@ -1167,8 +1318,8 @@ class VaultStorage(private val context: Context) {
             detectedExt = rawSig.extension
         }
 
-        // 2. Mathematical AES-CTR baseIv + mimeType recovery (checks deterministicIv, zeroIv, sibling headers, and ftyp/PNG/JPEG matrix)
-        if (detectedMime == null && masterKey != null && actualHeader.size >= 16) {
+        // 2. Mathematical AES-CTR baseIv + mimeType recovery for legacy headerless .bin files
+        if (detectedMime == null && masterKey != null && cipherSample.size >= 16) {
             val mathRecovered = recoverOrphanedBinBaseIvAndMime(
                 blobFile = blobFile,
                 masterKey = masterKey,
@@ -1178,7 +1329,7 @@ class VaultStorage(private val context: Context) {
                 chosenIv = mathRecovered.first
                 detectedMime = mathRecovered.second
                 detectedExt = extensionFromMimeType(detectedMime!!)
-                val dec64 = CryptoEngine.decryptHeaderBytesCtr(actualHeader, masterKey, chosenIv)
+                val dec64 = CryptoEngine.decryptHeaderBytesCtr(cipherSample, masterKey, chosenIv)
                 if (dec64.size >= 16) {
                     siblingPlainHeaders.add(0, dec64.copyOfRange(0, 16))
                 }
@@ -1198,7 +1349,7 @@ class VaultStorage(private val context: Context) {
                     detectedMime = guessMimeTypeFromExtension(baseNameWithoutBin, "image/jpeg")
                     detectedExt = ".$extCandidate"
                 }
-                blobFile.length() >= 2L * 1024L * 1024L -> {
+                logicalPlainSize >= 2L * 1024L * 1024L -> {
                     detectedMime = "video/mp4"
                     detectedExt = ".mp4"
                 }
@@ -1235,11 +1386,11 @@ class VaultStorage(private val context: Context) {
             originalPath = restoredPath,
             encryptedRelativePath = blobName,
             mimeType = finalMime,
-            fileSize = blobFile.length(),
+            fileSize = logicalPlainSize,
             dateAdded = lastMod,
             folderId = subfolderId,
             isFavorite = false,
-            isDecoy = false,
+            isDecoy = isDecoy,
             durationMs = durationMs,
             baseIvHex = toHex(chosenIv)
         )
@@ -1247,7 +1398,7 @@ class VaultStorage(private val context: Context) {
 
     /**
      * Fix 4C: Imports external `.bin` (and optional `.meta` / `.thumb`) files selected by the user
-     * from anywhere on their phone into `vaultBlobsDir` / `vaultThumbsDir`, runs mathematical
+     * from anywhere on their phone into `vaultBlobsDir` / `vaultThumbsDir`, runs `LVBIN001` + mathematical
      * `baseIv` recovery (`reconcileAndRecoverCatalog`), and optionally decrypts/exports them
      * directly to `/storage/emulated/0/Pictures/Restored_Vault` as playable `.mp4` / `.jpg` files.
      *
@@ -1256,7 +1407,8 @@ class VaultStorage(private val context: Context) {
     suspend fun importAndRecoverExternalBinFiles(
         uris: List<Uri>,
         masterKey: SecretKey,
-        exportToGallery: Boolean
+        exportToGallery: Boolean,
+        isDecoy: Boolean = false
     ): Pair<Int, Int> = VaultRepository.withVaultLock {
         if (uris.isEmpty()) return@withVaultLock Pair(0, 0)
 
@@ -1341,13 +1493,13 @@ class VaultStorage(private val context: Context) {
             // Reconcile and mathematically recover all .bin files in vaultBlobsDir
             val report = recoverOrphanedVaultFilesLocked(
                 masterKey = masterKey,
-                isDecoy = false,
+                isDecoy = isDecoy,
                 showProgress = false
             )
 
             var exportedCount = 0
             if (exportToGallery) {
-                val allItemsByPath = vaultDao.getAllItemsSync().associateBy { it.encryptedRelativePath }
+                val allItemsByPath = vaultDao.getAllItemsByDecoySync(isDecoy = isDecoy).associateBy { it.encryptedRelativePath }
                 val targetsToExport = if (importedBlobNames.isNotEmpty()) {
                     importedBlobNames.mapNotNull { allItemsByPath[it] }
                 } else {
@@ -1362,7 +1514,8 @@ class VaultStorage(private val context: Context) {
                 targetsToExport.forEachIndexed { idx, item ->
                     val blobFile = File(vaultBlobsDir, item.encryptedRelativePath)
                     if (blobFile.exists() && blobFile.length() > 0L) {
-                        val baseIv = fromHex(item.baseIvHex)
+                        val lvHeader = CryptoEngine.readLvBinHeader(blobFile)
+                        val baseIv = lvHeader?.baseIv ?: fromHex(item.baseIvHex)
                         var outFile = File(exportDir, item.fileName)
                         if (outFile.exists()) {
                             val namePart = item.fileName.substringBeforeLast('.')
@@ -1371,20 +1524,34 @@ class VaultStorage(private val context: Context) {
                             outFile = File(exportDir, "${namePart}_${System.currentTimeMillis()}$suffix")
                         }
                         try {
-                            BufferedInputStream(FileInputStream(blobFile), IO_CHUNK_BUFFER_BYTES).use { bis ->
-                                FileOutputStream(outFile).use { fos ->
-                                    BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bos ->
-                                        CryptoEngine.decryptStreamCtr(
-                                            inputStream = bis,
-                                            outputStream = bos,
-                                            secretKey = masterKey,
-                                            baseIv = baseIv
-                                        )
-                                        bos.flush()
+                            FileInputStream(blobFile).use { fis ->
+                                if (lvHeader != null) {
+                                    var skipped = 0L
+                                    while (skipped < CryptoEngine.LVBIN_HEADER_SIZE.toLong()) {
+                                        val s = fis.skip(CryptoEngine.LVBIN_HEADER_SIZE.toLong() - skipped)
+                                        if (s <= 0L) {
+                                            if (fis.read() == -1) break
+                                            skipped += 1L
+                                        } else {
+                                            skipped += s
+                                        }
                                     }
-                                    try {
-                                        fos.fd.sync()
-                                    } catch (_: Throwable) {
+                                }
+                                BufferedInputStream(fis, IO_CHUNK_BUFFER_BYTES).use { bis ->
+                                    FileOutputStream(outFile).use { fos ->
+                                        BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bos ->
+                                            CryptoEngine.decryptStreamCtr(
+                                                inputStream = bis,
+                                                outputStream = bos,
+                                                secretKey = masterKey,
+                                                baseIv = baseIv
+                                            )
+                                            bos.flush()
+                                        }
+                                        try {
+                                            fos.fd.sync()
+                                        } catch (_: Throwable) {
+                                        }
                                     }
                                 }
                             }
@@ -2065,11 +2232,17 @@ class VaultStorage(private val context: Context) {
                     return null
                 }
 
-                // Step 1 & 2 (FIX 1A): Encrypt stream into tempBlobFile using CryptoEngine.encryptStreamCtr
-                // (which explicitly flushes cipher.doFinal()) and invoke fos.fd.sync() before closing.
+                // Step 1 & 2 (FIX 1A): Write 32-byte self-contained LVBIN001 magic header
+                // ("LVBIN001" + 16-byte baseIv + 8-byte plaintextSize) at bytes 0..31,
+                // then encrypt stream starting at offset 32 into tempBlobFile and invoke fos.fd.sync().
+                val initialHeaderBytes = CryptoEngine.buildLvBinHeader(
+                    baseIv = baseIv,
+                    plaintextSize = expectedSourceLength.coerceAtLeast(0L)
+                )
                 BufferedInputStream(rawInputStream, IO_CHUNK_BUFFER_BYTES).use { bufferedIn ->
                     FileOutputStream(tempBlobFile).use { fos ->
                         BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bufferedOut ->
+                            bufferedOut.write(initialHeaderBytes)
                             totalWritten = CryptoEngine.encryptStreamCtr(
                                 inputStream = bufferedIn,
                                 outputStream = bufferedOut,
@@ -2085,9 +2258,23 @@ class VaultStorage(private val context: Context) {
                     }
                 }
 
-                // Step 3 (FIX 1A & 1C): Verify exact byte length AND decrypted header integrity before renaming
+                // If reported expectedSourceLength differed from actual streamed bytes, patch bytes 24..31 in header
+                if (totalWritten > 0L && totalWritten != expectedSourceLength.coerceAtLeast(0L)) {
+                    RandomAccessFile(tempBlobFile, "rw").use { raf ->
+                        raf.seek(0L)
+                        raf.write(CryptoEngine.buildLvBinHeader(baseIv, totalWritten))
+                        try {
+                            raf.fd.sync()
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+
+                val expectedTotalBlobLength = CryptoEngine.LVBIN_HEADER_SIZE.toLong() + totalWritten
+
+                // Step 3 (FIX 1A & 1B): Verify exact byte length AND LVBIN001 + decrypted header integrity before renaming
                 if (!tempBlobFile.exists() ||
-                    tempBlobFile.length() != totalWritten ||
+                    tempBlobFile.length() != expectedTotalBlobLength ||
                     totalWritten <= 0L ||
                     (expectedSourceLength > 0L && totalWritten != expectedSourceLength)
                 ) {
@@ -2095,9 +2282,20 @@ class VaultStorage(private val context: Context) {
                     return null
                 }
 
-                // Verify that decrypting the first N bytes of tempBlobFile matches sourceHeaderSample bit-for-bit
-                val encryptedHeaderCheck = readFirstNBytes(tempBlobFile, sourceHeaderSample.size)
-                val decryptedHeaderCheck = CryptoEngine.decryptHeaderBytesCtr(encryptedHeaderCheck, masterKey, baseIv)
+                // Read back the LVBIN001 header and first N ciphertext bytes at offset 32, decrypt in memory,
+                // and verify bit-for-bit equality with sourceHeaderSample before deleting source file.
+                val (verifiedLvHeader, encryptedHeaderCheck) = CryptoEngine.readCiphertextHeaderSample(
+                    blobFile = tempBlobFile,
+                    maxCipherBytes = sourceHeaderSample.size
+                )
+                if (verifiedLvHeader == null ||
+                    !verifiedLvHeader.baseIv.contentEquals(baseIv) ||
+                    verifiedLvHeader.plaintextSize != totalWritten
+                ) {
+                    tempBlobFile.delete()
+                    return null
+                }
+                val decryptedHeaderCheck = CryptoEngine.decryptHeaderBytesCtr(encryptedHeaderCheck, masterKey, verifiedLvHeader.baseIv)
                 if (decryptedHeaderCheck.size != sourceHeaderSample.size ||
                     !decryptedHeaderCheck.contentEquals(sourceHeaderSample) ||
                     isAllZeroBytes(decryptedHeaderCheck)
@@ -2111,7 +2309,7 @@ class VaultStorage(private val context: Context) {
                     tempBlobFile.delete()
                 }
 
-                if (!blobFile.exists() || blobFile.length() != totalWritten || totalWritten <= 0L) {
+                if (!blobFile.exists() || blobFile.length() != expectedTotalBlobLength || totalWritten <= 0L) {
                     tempBlobFile.delete()
                     blobFile.delete()
                     return null
@@ -2162,7 +2360,7 @@ class VaultStorage(private val context: Context) {
 
                     val verifiedDbRow = insertedId > 0L && vaultDao.getItemByEncryptedPath(blobName) != null
                     val verifiedMetaOnDisk = metaFile.exists() && metaFile.length() > 0L
-                    val verifiedBlobOnDisk = blobFile.exists() && blobFile.length() == totalWritten && totalWritten > 0L
+                    val verifiedBlobOnDisk = blobFile.exists() && blobFile.length() == expectedTotalBlobLength && totalWritten > 0L
 
                     if (!verifiedDbRow || !verifiedMetaOnDisk || !verifiedBlobOnDisk) {
                         if (insertedId > 0L) {
@@ -3061,8 +3259,8 @@ class VaultStorage(private val context: Context) {
         reservedTargetPaths: MutableSet<String>?
     ): UnhideWorkerResult? {
         val blobFile = File(vaultBlobsDir, item.encryptedRelativePath)
-        val expectedSize = blobFile.length()
-        if (!blobFile.exists() || expectedSize <= 0L) return null
+        val rawBlobLength = blobFile.length()
+        if (!blobFile.exists() || rawBlobLength <= 0L) return null
 
         val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
         val defaultRestoredDir = File(picturesDir, "Restored_Vault")
@@ -3078,70 +3276,110 @@ class VaultStorage(private val context: Context) {
         val tempRestoreFile = File(parentDir, ".tmp_restore_${UUID.randomUUID()}_${targetFile.name}")
 
         return try {
-            // Pre-flight check: inspect first 64 bytes of blobFile
-            val actualHeader = readFirstNBytes(blobFile, 64)
-            if (actualHeader.isEmpty() || isAllZeroBytes(actualHeader)) {
+            // Auto-detect self-contained 32-byte LVBIN001 magic header or legacy headerless .bin format
+            val (lvHeader, cipherHeaderSample) = CryptoEngine.readCiphertextHeaderSample(blobFile, 64)
+            if (cipherHeaderSample.isEmpty() || isAllZeroBytes(cipherHeaderSample)) {
                 return null
             }
 
-            val rawSig = CryptoEngine.detectMediaSignature(actualHeader)
-            if (rawSig != null) {
-                // Physical file is already raw unencrypted media; copy atomically via tempRestoreFile + fd.sync()
-                BufferedInputStream(FileInputStream(blobFile), IO_CHUNK_BUFFER_BYTES).use { bis ->
-                    FileOutputStream(tempRestoreFile).use { fos ->
-                        BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bos ->
-                            val buf = ByteArray(IO_CHUNK_BUFFER_BYTES)
-                            var r: Int
-                            while (bis.read(buf).also { r = it } != -1) {
-                                bos.write(buf, 0, r)
-                            }
-                            bos.flush()
-                        }
-                        try {
-                            fos.fd.sync()
-                        } catch (_: Throwable) {
-                        }
-                    }
+            val expectedPlaintextSize: Long
+            if (lvHeader != null) {
+                val payloadBytesOnDisk = (rawBlobLength - CryptoEngine.LVBIN_HEADER_SIZE).coerceAtLeast(0L)
+                expectedPlaintextSize = if (lvHeader.plaintextSize > 0L) lvHeader.plaintextSize else payloadBytesOnDisk
+                if (expectedPlaintextSize <= 0L || payloadBytesOnDisk < expectedPlaintextSize) {
+                    return null
                 }
-            } else {
-                val storedIv = fromHex(item.baseIvHex).let {
-                    if (it.size == 16) it else CryptoEngine.deriveDeterministicIv(masterKey, item.encryptedRelativePath)
-                }
-                val detIv = CryptoEngine.deriveDeterministicIv(masterKey, item.encryptedRelativePath)
-                val zeroIv = ByteArray(16)
-
-                val effectiveIv = when {
-                    CryptoEngine.detectMediaSignature(CryptoEngine.decryptHeaderBytesCtr(actualHeader, masterKey, storedIv)) != null -> storedIv
-                    CryptoEngine.detectMediaSignature(CryptoEngine.decryptHeaderBytesCtr(actualHeader, masterKey, detIv)) != null -> detIv
-                    CryptoEngine.detectMediaSignature(CryptoEngine.decryptHeaderBytesCtr(actualHeader, masterKey, zeroIv)) != null -> zeroIv
-                    else -> {
-                        val mathRecovered = recoverOrphanedBinBaseIvAndMime(blobFile, masterKey)
-                        mathRecovered?.first ?: storedIv
-                    }
-                }
-
-                // Pre-flight header integrity verification before writing restored file
-                val decryptedPreview = CryptoEngine.decryptHeaderBytesCtr(actualHeader, masterKey, effectiveIv)
+                val effectiveIv = lvHeader.baseIv
+                val decryptedPreview = CryptoEngine.decryptHeaderBytesCtr(cipherHeaderSample, masterKey, effectiveIv)
                 if (decryptedPreview.isEmpty() || isAllZeroBytes(decryptedPreview)) {
                     return null
                 }
 
-                BufferedInputStream(FileInputStream(blobFile), IO_CHUNK_BUFFER_BYTES).use { bufferedIn ->
-                    FileOutputStream(tempRestoreFile).use { fos ->
-                        BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bufferedOut ->
-                            CryptoEngine.decryptStreamCtr(bufferedIn, bufferedOut, masterKey, effectiveIv)
-                            bufferedOut.flush()
+                FileInputStream(blobFile).use { fis ->
+                    var skipped = 0L
+                    while (skipped < CryptoEngine.LVBIN_HEADER_SIZE) {
+                        val s = fis.skip(CryptoEngine.LVBIN_HEADER_SIZE - skipped)
+                        if (s <= 0L) {
+                            if (fis.read() == -1) break
+                            skipped += 1L
+                        } else {
+                            skipped += s
                         }
-                        try {
-                            fos.fd.sync()
-                        } catch (_: Throwable) {
+                    }
+                    BufferedInputStream(fis, IO_CHUNK_BUFFER_BYTES).use { bufferedIn ->
+                        FileOutputStream(tempRestoreFile).use { fos ->
+                            BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bufferedOut ->
+                                CryptoEngine.decryptStreamCtr(bufferedIn, bufferedOut, masterKey, effectiveIv)
+                                bufferedOut.flush()
+                            }
+                            try {
+                                fos.fd.sync()
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                }
+            } else {
+                expectedPlaintextSize = rawBlobLength
+                val rawSig = CryptoEngine.detectMediaSignature(cipherHeaderSample)
+                if (rawSig != null) {
+                    // Physical file is already raw unencrypted media; copy atomically via tempRestoreFile + fd.sync()
+                    BufferedInputStream(FileInputStream(blobFile), IO_CHUNK_BUFFER_BYTES).use { bis ->
+                        FileOutputStream(tempRestoreFile).use { fos ->
+                            BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bos ->
+                                val buf = ByteArray(IO_CHUNK_BUFFER_BYTES)
+                                var r: Int
+                                while (bis.read(buf).also { r = it } != -1) {
+                                    bos.write(buf, 0, r)
+                                }
+                                bos.flush()
+                            }
+                            try {
+                                fos.fd.sync()
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                } else {
+                    val storedIv = fromHex(item.baseIvHex).let {
+                        if (it.size == 16) it else CryptoEngine.deriveDeterministicIv(masterKey, item.encryptedRelativePath)
+                    }
+                    val detIv = CryptoEngine.deriveDeterministicIv(masterKey, item.encryptedRelativePath)
+                    val zeroIv = ByteArray(16)
+
+                    val effectiveIv = when {
+                        CryptoEngine.detectMediaSignature(CryptoEngine.decryptHeaderBytesCtr(cipherHeaderSample, masterKey, storedIv)) != null -> storedIv
+                        CryptoEngine.detectMediaSignature(CryptoEngine.decryptHeaderBytesCtr(cipherHeaderSample, masterKey, detIv)) != null -> detIv
+                        CryptoEngine.detectMediaSignature(CryptoEngine.decryptHeaderBytesCtr(cipherHeaderSample, masterKey, zeroIv)) != null -> zeroIv
+                        else -> {
+                            val mathRecovered = recoverOrphanedBinBaseIvAndMime(blobFile, masterKey)
+                            mathRecovered?.first ?: storedIv
+                        }
+                    }
+
+                    // Pre-flight header integrity verification before writing restored file
+                    val decryptedPreview = CryptoEngine.decryptHeaderBytesCtr(cipherHeaderSample, masterKey, effectiveIv)
+                    if (decryptedPreview.isEmpty() || isAllZeroBytes(decryptedPreview)) {
+                        return null
+                    }
+
+                    BufferedInputStream(FileInputStream(blobFile), IO_CHUNK_BUFFER_BYTES).use { bufferedIn ->
+                        FileOutputStream(tempRestoreFile).use { fos ->
+                            BufferedOutputStream(fos, IO_CHUNK_BUFFER_BYTES).use { bufferedOut ->
+                                CryptoEngine.decryptStreamCtr(bufferedIn, bufferedOut, masterKey, effectiveIv)
+                                bufferedOut.flush()
+                            }
+                            try {
+                                fos.fd.sync()
+                            } catch (_: Throwable) {
+                            }
                         }
                     }
                 }
             }
 
             // Post-decryption verification: exact byte count match and non-zero header check
-            if (!tempRestoreFile.exists() || tempRestoreFile.length() != expectedSize || tempRestoreFile.length() <= 0L) {
+            if (!tempRestoreFile.exists() || tempRestoreFile.length() != expectedPlaintextSize || tempRestoreFile.length() <= 0L) {
                 tempRestoreFile.delete()
                 return null
             }
@@ -3157,7 +3395,7 @@ class VaultStorage(private val context: Context) {
                 tempRestoreFile.delete()
             }
 
-            if (!targetFile.exists() || targetFile.length() != expectedSize || targetFile.length() <= 0L) {
+            if (!targetFile.exists() || targetFile.length() != expectedPlaintextSize || targetFile.length() <= 0L) {
                 tempRestoreFile.delete()
                 targetFile.delete()
                 return null

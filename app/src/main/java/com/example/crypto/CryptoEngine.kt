@@ -23,7 +23,33 @@ data class DetectedMediaSignature(
     val isVideo: Boolean
 )
 
+/**
+ * FIX 1A: Self-Contained 32-Byte Cryptographic `.bin` File Header (`LVBIN001`).
+ * - Bytes 0..7   (8 bytes): Magic ASCII signature `"LVBIN001"`
+ * - Bytes 8..23  (16 bytes): Exact 16-byte `baseIv` used to encrypt the media payload
+ * - Bytes 24..31 (8 bytes): Original plaintext byte length (`Long`, big-endian)
+ * - Bytes 32..EOF: `AES/CTR/NoPadding` encrypted media stream starting at offset 0 of the original file
+ */
+data class LvBinHeader(
+    val baseIv: ByteArray,
+    val plaintextSize: Long,
+    val payloadOffset: Long = CryptoEngine.LVBIN_HEADER_SIZE.toLong()
+)
+
 object CryptoEngine {
+    const val LVBIN_MAGIC = "LVBIN001"
+    const val LVBIN_HEADER_SIZE = 32
+    private val LVBIN_MAGIC_BYTES = byteArrayOf(
+        'L'.code.toByte(),
+        'V'.code.toByte(),
+        'B'.code.toByte(),
+        'I'.code.toByte(),
+        'N'.code.toByte(),
+        '0'.code.toByte(),
+        '0'.code.toByte(),
+        '1'.code.toByte()
+    )
+
     private const val PBKDF2_ALGORITHM = "PBKDF2WithHmacSHA256"
     private const val KEY_SIZE_BITS = 256
     private const val PBKDF2_ITERATIONS = 100_000
@@ -31,6 +57,101 @@ object CryptoEngine {
     private const val GCM_IV_LENGTH_BYTES = 12
 
     private val random = SecureRandom()
+
+    /**
+     * Builds the 32-byte `LVBIN001` header containing the magic signature, 16-byte `baseIv`,
+     * and 8-byte big-endian `plaintextSize`.
+     */
+    fun buildLvBinHeader(baseIv: ByteArray, plaintextSize: Long): ByteArray {
+        require(baseIv.size == 16) { "baseIv must be 16 bytes" }
+        val buf = ByteBuffer.allocate(LVBIN_HEADER_SIZE)
+        buf.put(LVBIN_MAGIC_BYTES)
+        buf.put(baseIv)
+        buf.putLong(plaintextSize.coerceAtLeast(0L))
+        return buf.array()
+    }
+
+    /**
+     * Parses a 32-byte `LVBIN001` header if bytes `0..7` match `"LVBIN001"`.
+     * Returns `null` for legacy headerless `.bin` files.
+     */
+    fun parseLvBinHeader(headerBytes: ByteArray): LvBinHeader? {
+        if (headerBytes.size < LVBIN_HEADER_SIZE) return null
+        for (i in 0 until 8) {
+            if (headerBytes[i] != LVBIN_MAGIC_BYTES[i]) return null
+        }
+        val iv = headerBytes.copyOfRange(8, 24)
+        val plainSize = ByteBuffer.wrap(headerBytes, 24, 8).long
+        if (plainSize < 0L) return null
+        return LvBinHeader(
+            baseIv = iv,
+            plaintextSize = plainSize,
+            payloadOffset = LVBIN_HEADER_SIZE.toLong()
+        )
+    }
+
+    /**
+     * Inspects the first 32 bytes of `blobFile` on disk and returns its [LvBinHeader] if it carries
+     * the `"LVBIN001"` magic signature, or `null` if it is a legacy headerless `.bin` file.
+     */
+    fun readLvBinHeader(blobFile: File): LvBinHeader? {
+        if (!blobFile.exists() || !blobFile.isFile || blobFile.length() < LVBIN_HEADER_SIZE.toLong()) {
+            return null
+        }
+        val buf = ByteArray(LVBIN_HEADER_SIZE)
+        var total = 0
+        try {
+            FileInputStream(blobFile).use { fis ->
+                while (total < LVBIN_HEADER_SIZE) {
+                    val r = fis.read(buf, total, LVBIN_HEADER_SIZE - total)
+                    if (r <= 0) break
+                    total += r
+                }
+            }
+        } catch (_: Throwable) {
+            return null
+        }
+        if (total < LVBIN_HEADER_SIZE) return null
+        return parseLvBinHeader(buf)
+    }
+
+    /**
+     * Reads up to `maxCipherBytes` of actual ciphertext header bytes from `blobFile`, automatically
+     * skipping the 32-byte `LVBIN001` header when present.
+     */
+    fun readCiphertextHeaderSample(blobFile: File, maxCipherBytes: Int = 64): Pair<LvBinHeader?, ByteArray> {
+        if (!blobFile.exists() || !blobFile.isFile || blobFile.length() <= 0L) {
+            return Pair(null, ByteArray(0))
+        }
+        val toRead = LVBIN_HEADER_SIZE + maxCipherBytes
+        val buf = ByteArray(toRead)
+        var total = 0
+        try {
+            FileInputStream(blobFile).use { fis ->
+                while (total < toRead) {
+                    val r = fis.read(buf, total, toRead - total)
+                    if (r <= 0) break
+                    total += r
+                }
+            }
+        } catch (_: Throwable) {
+            return Pair(null, ByteArray(0))
+        }
+        if (total <= 0) return Pair(null, ByteArray(0))
+        val lvHeader = if (total >= LVBIN_HEADER_SIZE) parseLvBinHeader(buf) else null
+        return if (lvHeader != null) {
+            val cipherCount = (total - LVBIN_HEADER_SIZE).coerceIn(0, maxCipherBytes)
+            val cipherSlice = if (cipherCount > 0) {
+                buf.copyOfRange(LVBIN_HEADER_SIZE, LVBIN_HEADER_SIZE + cipherCount)
+            } else {
+                ByteArray(0)
+            }
+            Pair(lvHeader, cipherSlice)
+        } else {
+            val count = minOf(total, maxCipherBytes)
+            Pair(null, buf.copyOfRange(0, count))
+        }
+    }
 
     private val VALID_MP4_SECOND_ATOMS = setOf(
         "moov", "mdat", "free", "wide", "skip", "udta", "uuid", "meta", "styp", "pdin", "ftyp", "emsg", "moof", "sidx"
@@ -147,19 +268,13 @@ object CryptoEngine {
     }
 
     /**
-     * Fix 4A: Mathematical AES-CTR `baseIv` Recovery for Orphaned `.bin` Files Missing `.bin.meta`:
+     * Fix 1A & 4A: Self-Contained `LVBIN001` + Mathematical AES-CTR `baseIv` Recovery for Orphaned `.bin` Files:
      *
-     * In AES-CTR, Block 0 ($C_0$, bytes `0..15` of `blobFile`) satisfies:
-     *   $C_0 = P_0 \oplus \text{AES\_ECB\_Encrypt}(\text{masterKey}, \text{baseIv})$
-     * Therefore, given any candidate 16-byte plaintext header $P_0$:
-     *   $\text{candidateBaseIv} = \text{AES\_ECB\_Decrypt}(\text{masterKey}, C_0 \oplus P_0)$
-     *
-     * We then decrypt the 64-byte header ($C_0..C_3$) with `AES/CTR/NoPadding` using `candidateBaseIv`
-     * and verify Block 1 / Block 2 / Block 3 (bytes `16..63`), which use counter `candidateBaseIv + 1`,
-     * `candidateBaseIv + 2`, and `candidateBaseIv + 3`. A wrong `candidateBaseIv` produces 100% random
-     * noise in bytes `16..63`, whereas the true `baseIv` reveals valid MP4 atoms (`moov`, `mdat`, `free`,
-     * `wide`, etc. at offset `ftypSize + 4` or printable ASCII compatible brands at bytes `16..23`),
-     * valid PNG `IHDR` dimensions/colorType, or valid JPEG markers!
+     * 0. If `blobFile` contains the 32-byte `LVBIN001` header, its exact 16-byte `baseIv` is stored directly
+     *    in bytes `8..23`, and ciphertext begins at offset `32L`. We decrypt the first 64 ciphertext bytes
+     *    with `lvHeader.baseIv` and return `Pair(lvHeader.baseIv, detectedMime)` immediately!
+     * 1. For legacy headerless `.bin` files, we test deterministic IV, zero IV, and mathematical AES-ECB
+     *    inversion ($C_0 \oplus P_0$) verified against Block 1..3.
      */
     fun recoverOrphanedBinBaseIvAndMime(
         blobFile: File,
@@ -168,20 +283,19 @@ object CryptoEngine {
     ): Pair<ByteArray, String>? {
         if (!blobFile.exists() || blobFile.length() < 16L) return null
 
-        val headerBuf = ByteArray(64)
-        var bytesRead = 0
-        try {
-            FileInputStream(blobFile).use { fis ->
-                bytesRead = fis.read(headerBuf)
-            }
-        } catch (_: Throwable) {
-            return null
+        val (lvHeader, cipherHeader) = readCiphertextHeaderSample(blobFile, 64)
+        if (lvHeader != null) {
+            val plain = decryptHeaderBytesCtr(cipherHeader, masterKey, lvHeader.baseIv)
+            val sigMime = verifyDecryptedHeader64(plain)
+                ?: detectMediaSignature(plain)?.mimeType
+                ?: if (lvHeader.plaintextSize >= 2L * 1024L * 1024L) "video/mp4" else "image/jpeg"
+            return Pair(lvHeader.baseIv, sigMime)
         }
-        if (bytesRead < 16) return null
-        val cipherHeader = if (bytesRead == 64) headerBuf else headerBuf.copyOfRange(0, bytesRead)
+
+        if (cipherHeader.size < 16) return null
         val c0 = cipherHeader.copyOfRange(0, 16)
 
-        // 0. Fast-path check: deterministic IV or zero IV
+        // 0. Fast-path check for legacy headerless files: deterministic IV or zero IV
         val detIv = deriveDeterministicIv(masterKey, blobFile.name)
         val detPlain = decryptHeaderBytesCtr(cipherHeader, masterKey, detIv)
         val detVerifiedMime = verifyDecryptedHeader64(detPlain)

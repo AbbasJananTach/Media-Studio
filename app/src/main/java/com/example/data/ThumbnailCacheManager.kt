@@ -527,9 +527,25 @@ object ThumbnailCacheManager {
         masterKey: SecretKey,
         baseIv: ByteArray
     ): BufferedInputStream {
+        val lvHeader = CryptoEngine.readLvBinHeader(blobFile)
+        val effectiveIv = lvHeader?.baseIv ?: baseIv
+        val fis = FileInputStream(blobFile)
+        if (lvHeader != null) {
+            var skipped = 0L
+            while (skipped < CryptoEngine.LVBIN_HEADER_SIZE.toLong()) {
+                val s = fis.skip(CryptoEngine.LVBIN_HEADER_SIZE.toLong() - skipped)
+                if (s <= 0L) {
+                    val b = fis.read()
+                    if (b == -1) break
+                    skipped += 1L
+                } else {
+                    skipped += s
+                }
+            }
+        }
         val cipher = Cipher.getInstance("AES/CTR/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, masterKey, IvParameterSpec(baseIv))
-        return BufferedInputStream(CipherInputStream(FileInputStream(blobFile), cipher), 65536)
+        cipher.init(Cipher.DECRYPT_MODE, masterKey, IvParameterSpec(effectiveIv))
+        return BufferedInputStream(CipherInputStream(fis, cipher), 65536)
     }
 
     private fun decodeEncryptedVideoThumbnail(
@@ -538,25 +554,30 @@ object ThumbnailCacheManager {
         baseIv: ByteArray,
         knownDurationMs: Long = 0L
     ): Bitmap? {
+        val lvHeader = CryptoEngine.readLvBinHeader(blobFile)
+        val payloadOffset = if (lvHeader != null) CryptoEngine.LVBIN_HEADER_SIZE.toLong() else 0L
+        val effectiveIv = lvHeader?.baseIv ?: baseIv
+
         val retriever = MediaMetadataRetriever()
         val dataSource = object : MediaDataSource() {
             private val raf = RandomAccessFile(blobFile, "r")
+            private val logicalSize = (raf.length() - payloadOffset).coerceAtLeast(0L)
 
             @Synchronized
             override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
-                if (position >= raf.length()) return -1
+                if (position >= logicalSize) return -1
                 if (size == 0) return 0
 
                 val blockStart = (position / 16L) * 16L
                 val intraBlockOffset = (position % 16L).toInt()
                 val totalToRead = size + intraBlockOffset
 
-                raf.seek(blockStart)
+                raf.seek(payloadOffset + blockStart)
                 val encryptedBuf = ByteArray(totalToRead)
                 val bytesRead = raf.read(encryptedBuf, 0, totalToRead)
                 if (bytesRead <= intraBlockOffset) return -1
 
-                val adjustedIv = CryptoEngine.calculateCtrIvForOffset(baseIv, blockStart)
+                val adjustedIv = CryptoEngine.calculateCtrIvForOffset(effectiveIv, blockStart)
                 val cipher = Cipher.getInstance("AES/CTR/NoPadding")
                 cipher.init(Cipher.DECRYPT_MODE, masterKey, IvParameterSpec(adjustedIv))
                 val decrypted = cipher.doFinal(encryptedBuf, 0, bytesRead)
@@ -568,7 +589,7 @@ object ThumbnailCacheManager {
             }
 
             @Synchronized
-            override fun getSize(): Long = raf.length()
+            override fun getSize(): Long = logicalSize
 
             @Synchronized
             override fun close() {

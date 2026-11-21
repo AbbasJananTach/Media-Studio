@@ -41,7 +41,9 @@ class EncryptedFileDataSource(
     private var uri: Uri? = null
     private var currentPosition: Long = 0L
     private var bytesRemaining: Long = 0L
-    private var fileLength: Long = 0L
+    private var logicalPayloadLength: Long = 0L
+    private var payloadOffsetInFile: Long = 0L
+    private var activeBaseIv: ByteArray = baseIv
     private var isOpen = false
     private val cipher: Cipher = Cipher.getInstance("AES/CTR/NoPadding")
 
@@ -49,25 +51,41 @@ class EncryptedFileDataSource(
         uri = dataSpec.uri
         transferInitializing(dataSpec)
 
-        if (baseIv.size != 16) {
-            throw IOException("Invalid video IV header size (${baseIv.size})")
-        }
         if (!blobFile.exists() || !blobFile.isFile || blobFile.length() <= 0L) {
             throw EOFException("Encrypted media blob not found or empty: ${blobFile.name}")
         }
 
         try {
+            val lvHeader = CryptoEngine.readLvBinHeader(blobFile)
             val raf = RandomAccessFile(blobFile, "r")
             randomAccessFile = raf
-            fileLength = raf.length()
+            val rawDiskLength = raf.length()
+
+            if (lvHeader != null) {
+                payloadOffsetInFile = CryptoEngine.LVBIN_HEADER_SIZE.toLong()
+                activeBaseIv = lvHeader.baseIv
+                val availablePayload = (rawDiskLength - payloadOffsetInFile).coerceAtLeast(0L)
+                logicalPayloadLength = if (lvHeader.plaintextSize in 1L..availablePayload) {
+                    lvHeader.plaintextSize
+                } else {
+                    availablePayload
+                }
+            } else {
+                if (baseIv.size != 16) {
+                    throw IOException("Invalid video IV header size (${baseIv.size})")
+                }
+                payloadOffsetInFile = 0L
+                activeBaseIv = baseIv
+                logicalPayloadLength = rawDiskLength
+            }
 
             if (dataSpec.position < 0L) {
                 throw IOException("Invalid negative seek position: ${dataSpec.position}")
             }
 
-            if (dataSpec.position >= fileLength) {
+            if (dataSpec.position >= logicalPayloadLength) {
                 bytesRemaining = 0L
-                currentPosition = fileLength
+                currentPosition = logicalPayloadLength
                 isOpen = true
                 transferStarted(dataSpec)
                 return 0L
@@ -75,9 +93,9 @@ class EncryptedFileDataSource(
 
             currentPosition = dataSpec.position
             bytesRemaining = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
-                minOf(dataSpec.length, fileLength - dataSpec.position)
+                minOf(dataSpec.length, logicalPayloadLength - dataSpec.position)
             } else {
-                fileLength - dataSpec.position
+                logicalPayloadLength - dataSpec.position
             }
 
             isOpen = true
@@ -101,13 +119,13 @@ class EncryptedFileDataSource(
             val bytesToRead = minOf(length.toLong(), bytesRemaining).toInt()
             if (bytesToRead <= 0) return C.RESULT_END_OF_INPUT
 
-            // Stateless 16-byte AES-CTR block alignment
+            // Stateless 16-byte AES-CTR block alignment relative to logical payload start (0L)
             val blockStart = (currentPosition / 16L) * 16L
             val intraBlockOffset = (currentPosition % 16L).toInt()
             val rawNeeded = intraBlockOffset + bytesToRead
-            // Align read size to 16-byte multiple (clamped to remaining file length from blockStart)
+            // Align read size to 16-byte multiple (clamped to remaining logical payload length from blockStart)
             val alignedNeeded = ((rawNeeded + 15) / 16) * 16
-            val maxAvailableFromBlockStart = (fileLength - blockStart).coerceAtLeast(0L).toInt()
+            val maxAvailableFromBlockStart = (logicalPayloadLength - blockStart).coerceAtLeast(0L).toInt()
             val totalToRead = minOf(alignedNeeded, maxAvailableFromBlockStart)
 
             if (totalToRead <= intraBlockOffset) {
@@ -117,7 +135,7 @@ class EncryptedFileDataSource(
             val encryptedBuffer = ByteArray(totalToRead)
             var totalReadFromDisk = 0
             synchronized(raf) {
-                raf.seek(blockStart)
+                raf.seek(payloadOffsetInFile + blockStart)
                 while (totalReadFromDisk < totalToRead) {
                     val r = raf.read(encryptedBuffer, totalReadFromDisk, totalToRead - totalReadFromDisk)
                     if (r == -1) break
@@ -129,7 +147,7 @@ class EncryptedFileDataSource(
                 return C.RESULT_END_OF_INPUT
             }
 
-            val adjustedIv = CryptoEngine.calculateCtrIvForOffset(baseIv, blockStart)
+            val adjustedIv = CryptoEngine.calculateCtrIvForOffset(activeBaseIv, blockStart)
             cipher.init(Cipher.DECRYPT_MODE, masterKey, IvParameterSpec(adjustedIv))
             val decrypted = cipher.doFinal(encryptedBuffer, 0, totalReadFromDisk)
 

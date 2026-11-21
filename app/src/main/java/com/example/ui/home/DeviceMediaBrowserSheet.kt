@@ -230,12 +230,14 @@ fun DeviceMediaBrowserSheet(
         isLoading = true
         deviceFolders = vaultStorage.queryDeviceFolders()
         allMediaItems = vaultStorage.queryDeviceMediaFiles(null)
+            .filterNot { vaultStorage.isExcludedFromDeviceMediaPicker(it.path) }
         isLoading = false
     }
 
     LaunchedEffect(selectedFolderFilter) {
         isLoading = true
         allMediaItems = vaultStorage.queryDeviceMediaFiles(selectedFolderFilter)
+            .filterNot { vaultStorage.isExcludedFromDeviceMediaPicker(it.path) }
         isLoading = false
     }
 

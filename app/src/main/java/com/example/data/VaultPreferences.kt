@@ -34,6 +34,14 @@ class VaultPreferences(context: Context) {
     )
     val autoLockMode: StateFlow<AutoLockMode> = _autoLockMode.asStateFlow()
 
+    /**
+     * FIX 4: Auto-Lock Timer in minutes (supports 20, 40, and 60 minutes; defaults to 60 minutes = 1 Hour).
+     */
+    private val _autoLockTimeoutMinutes = MutableStateFlow(
+        normalizeAutoLockTimeoutMinutes(prefs.getInt(KEY_AUTO_LOCK_TIMEOUT_MINUTES, 60))
+    )
+    val autoLockTimeoutMinutes: StateFlow<Int> = _autoLockTimeoutMinutes.asStateFlow()
+
     private val _bruteForceLockoutEnabled = MutableStateFlow(
         prefs.getBoolean(KEY_BRUTE_FORCE_LOCKOUT, true)
     )
@@ -91,6 +99,12 @@ class VaultPreferences(context: Context) {
         _autoLockMode.value = mode
     }
 
+    fun setAutoLockTimeoutMinutes(minutes: Int) {
+        val valid = normalizeAutoLockTimeoutMinutes(minutes)
+        prefs.edit().putInt(KEY_AUTO_LOCK_TIMEOUT_MINUTES, valid).apply()
+        _autoLockTimeoutMinutes.value = valid
+    }
+
     fun setBruteForceLockoutEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_BRUTE_FORCE_LOCKOUT, enabled).apply()
         _bruteForceLockoutEnabled.value = enabled
@@ -145,6 +159,7 @@ class VaultPreferences(context: Context) {
     companion object {
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_AUTO_LOCK_MODE = "auto_lock_mode"
+        private const val KEY_AUTO_LOCK_TIMEOUT_MINUTES = "auto_lock_timeout_minutes"
         private const val KEY_BRUTE_FORCE_LOCKOUT = "brute_force_lockout"
         private const val KEY_BLOCK_SCREENSHOTS = "block_screenshots"
         private const val KEY_DEFAULT_GRID_COLUMNS = "default_grid_columns"
@@ -152,6 +167,12 @@ class VaultPreferences(context: Context) {
         private const val KEY_SHOW_FILE_NAMES = "show_file_names"
         private const val KEY_AUTO_HIDE_ENABLED = "auto_hide_enabled"
         private const val KEY_WATCHED_FOLDERS = "watched_folders"
+
+        val SUPPORTED_AUTO_LOCK_TIMEOUT_MINUTES = listOf(20, 40, 60)
+
+        fun normalizeAutoLockTimeoutMinutes(minutes: Int): Int {
+            return if (minutes in SUPPORTED_AUTO_LOCK_TIMEOUT_MINUTES) minutes else 60
+        }
 
         fun getPresetWatchableFolders(): List<Pair<String, String>> {
             val ext = Environment.getExternalStorageDirectory().absolutePath
